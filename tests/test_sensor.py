@@ -5,13 +5,11 @@ Tests cover:
 - Sensor generation
 - Fault injection
 - Stream behavior
-- CSV sensor wrapper
 """
 
 import pytest
 import numpy as np
-from pathlib import Path
-from edge.sensor import VibrationSensor, SensorConfig, SensorSample, CSVSensor, generate_csv_stream
+from edge.sensor import VibrationSensor, SensorConfig, SensorSample
 
 
 class TestSensorConfig:
@@ -165,55 +163,6 @@ class TestVibrationSensor:
         # Time between samples should be ~0.001 (1/1000)
         diffs = np.diff(timestamps)
         assert np.allclose(diffs, 0.001, rtol=1e-5)
-
-
-class TestCSVSensor:
-    """Tests for CSVSensor."""
-    
-    def test_csv_stream_from_file(self):
-        """Test reading from CSV file."""
-        csv_path = "data/sample_dataset_small.csv"
-        
-        if not Path(csv_path).exists():
-            pytest.skip("Sample CSV file not found")
-        
-        sensor = CSVSensor(csv_path, value_column="strain")
-        
-        # Get first few valid samples (CSV has empty rows, so we need to iterate)
-        stream = sensor.stream()
-        samples = []
-        for _ in range(20):  # Try up to 20 rows to get 10 valid samples
-            try:
-                sample = next(stream)
-                samples.append(sample)
-                if len(samples) >= 10:
-                    break
-            except StopIteration:
-                break
-        
-        assert len(samples) >= 5, "Should get at least 5 valid samples"  # CSV has many valid samples
-        
-        for sample in samples:
-            assert isinstance(sample, SensorSample)
-            # Acceleration should have values from CSV
-            assert isinstance(sample.acceleration, float)
-    
-    def test_csv_generator(self):
-        """Test generate_csv_stream function."""
-        csv_path = "data/sample_dataset_small.csv"
-        
-        if not Path(csv_path).exists():
-            pytest.skip("Sample CSV file not found")
-        
-        # Get first few valid values (CSV has empty rows)
-        values = []
-        for i, (timestamp, value) in enumerate(generate_csv_stream(csv_path, value_column="strain")):
-            values.append(value)
-            if i >= 9:
-                break
-        
-        # We should get some values (CSV has many valid entries)
-        assert len(values) >= 5, "Should get at least 5 valid values"
 
 
 class TestSensorSample:

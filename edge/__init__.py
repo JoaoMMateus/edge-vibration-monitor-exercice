@@ -6,7 +6,7 @@ Contains:
 - processor.py: Streaming processor
 """
 
-from .sensor import VibrationSensor, SensorConfig, SensorSample, CSVSensor
+from .sensor import VibrationSensor, SensorConfig, SensorSample
 from .processor import (
     StreamingProcessor,
     CircularBuffer,
@@ -14,8 +14,7 @@ from .processor import (
     AnomalyDetectionResult,
     RollingFeatureExtractor,
     AnomalyDetector,
-    benchmark_throughput,
-    run_from_csv
+    benchmark_throughput
 )
 
 __version__ = "0.1.0"
