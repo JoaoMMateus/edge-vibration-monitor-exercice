@@ -7,8 +7,6 @@ Consumes sensor stream in real-time (or simulated real-time) and:
 - Flags anomalies using threshold-based detection
 - Reports precision/recall against known fault windows
 - Sustains 1000+ samples/sec throughput
-
-Memory footprint: O(window_size) - bounded by the rolling window size.
 """
 
 import numpy as np

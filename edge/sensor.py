@@ -1,5 +1,5 @@
 """
-Part 1: Synthetic Vibration Sensor
+Synthetic Vibration Sensor
 
 A damped harmonic oscillator driven by noise, simulating vibration sensor data.
 The system: x''(t) + 2*zeta*omega_n*x'(t) + omega_n^2*x(t) = F(t)

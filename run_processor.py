@@ -24,8 +24,9 @@ from edge.sensor import VibrationSensor, SensorConfig, SensorSample
 from edge.processor import (
     StreamingProcessor,
     WindowFeatures,
-    benchmark_throughput
+    benchmark_throughput,
 )
+from edge.trace import log_call, log_output
 
 
 def parse_args():
@@ -169,15 +170,18 @@ Examples:
 def create_sensor_config(args) -> SensorConfig:
     """Create sensor configuration from arguments."""
     import numpy as np
-    return SensorConfig(
+    log_call("create_sensor_config")
+    config = SensorConfig(
         sample_rate=args.sample_rate,
         omega_n=2 * np.pi * 10.0,
         zeta=0.1,
         noise_std=0.1,
         fault_start=args.fault_start,
         fault_duration=args.fault_duration,
-        seed=args.seed
+        seed=args.seed,
     )
+    log_output("create_sensor_config", config)
+    return config
 
 
 def format_features(features: WindowFeatures) -> str:
@@ -193,6 +197,7 @@ def format_features(features: WindowFeatures) -> str:
 
 def run_benchmark_mode(args) -> dict:
     """Run throughput benchmark with synthetic data."""
+    log_call("run_benchmark_mode")
     if not args.quiet:
         print(f"\n{'='*60}")
         print("RUNNING THROUGHPUT BENCHMARK")
@@ -204,29 +209,30 @@ def run_benchmark_mode(args) -> dict:
         print(f"  Seed: {args.seed}")
         print(f"  Thresholds: RMS={args.rms_threshold}, Freq={args.freq_threshold}, Std={args.std_threshold}")
         print(f"\nStarting benchmark...")
-    
+
     result = benchmark_throughput(
         sample_rate=args.sample_rate,
         duration=args.duration,
         window_size=args.window_size,
         rms_threshold_multiple=args.rms_threshold,
         freq_shift_threshold=args.freq_threshold,
-        std_threshold_multiple=args.std_threshold
+        std_threshold_multiple=args.std_threshold,
     )
-    
-    # Add configuration info to result
+
     result['config'] = {
         'sample_rate': args.sample_rate,
         'window_size': args.window_size,
         'duration': args.duration,
-        'seed': args.seed
+        'seed': args.seed,
     }
-    
+
+    log_output("run_benchmark_mode", result)
     return result
 
 
 def run_realtime_mode(args) -> dict:
     """Run real-time simulation with throttling."""
+    log_call("run_realtime_mode")
     if not args.quiet:
         print(f"\n{'='*60}")
         print("REAL-TIME SIMULATION")
@@ -235,14 +241,14 @@ def run_realtime_mode(args) -> dict:
         print(f"Window size: {args.window_size} seconds")
         print(f"Duration: {args.duration} seconds")
         print(f"Simulating real-time throttling...")
-    
+
     config = create_sensor_config(args)
     sensor = VibrationSensor(config)
-    
+
     fault_windows = [
         (config.fault_start, config.fault_start + config.fault_duration)
     ]
-    
+
     processor = StreamingProcessor(
         sample_rate=args.sample_rate,
         window_size=args.window_size,
@@ -250,13 +256,13 @@ def run_realtime_mode(args) -> dict:
         simulate_real_time=True,
         rms_threshold_multiple=args.rms_threshold,
         freq_shift_threshold=args.freq_threshold,
-        std_threshold_multiple=args.std_threshold
+        std_threshold_multiple=args.std_threshold,
     )
-    
+
     start_time = time.time()
     n_samples = int(args.duration * args.sample_rate)
     results = []
-    
+
     for i in range(n_samples):
         sample = sensor.step()
         window_features = processor.process_sample(sample)
@@ -264,11 +270,11 @@ def run_realtime_mode(args) -> dict:
             results.append(window_features)
             if args.verbose:
                 print(format_features(window_features))
-    
+
     elapsed = time.time() - start_time
     throughput_stats = processor.get_throughput_stats()
-    
-    return {
+
+    result = {
         'mode': 'realtime',
         'n_samples': n_samples,
         'elapsed_time': elapsed,
@@ -279,14 +285,17 @@ def run_realtime_mode(args) -> dict:
         'config': {
             'sample_rate': args.sample_rate,
             'window_size': args.window_size,
-            'duration': args.duration
+            'duration': args.duration,
         },
-        'results': results if args.verbose else []
+        'results': results if args.verbose else [],
     }
+    log_output("run_realtime_mode", result)
+    return result
 
 
 def run_interactive_mode(args) -> dict:
     """Run interactive mode with live output."""
+    log_call("run_interactive_mode")
     print(f"\n{'='*60}")
     print("INTERACTIVE MODE (Press Ctrl+C to stop)")
     print(f"{'='*60}")
@@ -294,14 +303,14 @@ def run_interactive_mode(args) -> dict:
     print(f"Window size: {args.window_size} seconds")
     print(f"\nPress Ctrl+C to stop at any time...")
     print(f"{'-'*60}")
-    
+
     config = create_sensor_config(args)
     sensor = VibrationSensor(config)
-    
+
     fault_windows = [
         (config.fault_start, config.fault_start + config.fault_duration)
     ]
-    
+
     processor = StreamingProcessor(
         sample_rate=args.sample_rate,
         window_size=args.window_size,
@@ -309,25 +318,23 @@ def run_interactive_mode(args) -> dict:
         simulate_real_time=False,
         rms_threshold_multiple=args.rms_threshold,
         freq_shift_threshold=args.freq_threshold,
-        std_threshold_multiple=args.std_threshold
+        std_threshold_multiple=args.std_threshold,
     )
-    
+
     results = []
     start_time = time.time()
     sample_count = 0
-    
+
     try:
         while True:
             sample = sensor.step()
             window_features = processor.process_sample(sample)
             sample_count += 1
-            
+
             if window_features is not None:
                 results.append(window_features)
-                # Print formatted output
                 print(format_features(window_features))
-                
-                # Print summary every 10 windows
+
                 if len(results) % 10 == 0:
                     elapsed = time.time() - start_time
                     stats = processor.get_throughput_stats()
@@ -336,11 +343,11 @@ def run_interactive_mode(args) -> dict:
                           f"{stats['samples_per_sec']:.1f} samples/sec]")
     except KeyboardInterrupt:
         print("\n\nStopped by user.")
-    
+
     elapsed = time.time() - start_time
     throughput_stats = processor.get_throughput_stats()
-    
-    return {
+
+    result = {
         'mode': 'interactive',
         'n_samples': sample_count,
         'elapsed_time': elapsed,
@@ -349,9 +356,11 @@ def run_interactive_mode(args) -> dict:
         'n_windows': len(results),
         'config': {
             'sample_rate': args.sample_rate,
-            'window_size': args.window_size
+            'window_size': args.window_size,
         }
     }
+    log_output("run_interactive_mode", result)
+    return result
 
 
 def print_benchmark_results(result: dict, json_output: bool = False) -> None:
