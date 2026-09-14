@@ -15,7 +15,15 @@ import tempfile
 import time
 
 from edge.processor import WindowFeatures
-from edge.sync import Batch, CloudSync, FileQueue, MockS3Client, S3Config
+from edge.sync import (
+    Batch,
+    CloudSync,
+    Downsampler,
+    FileQueue,
+    MockS3Client,
+    RealS3Client,
+    S3Config,
+)
 
 
 class TestFileQueue:
@@ -343,6 +351,56 @@ class TestS3Config:
         assert config.region == "eu-west-1"
         assert config.endpoint_url == "http://localhost:4566"
         assert config.use_ssl is False
+
+
+class TestDownsamplerAndRealS3:
+    """Regression tests for requested sync support."""
+
+    def test_downsampler_10hz_sample_selection(self):
+        """A 1000Hz feed should produce 10Hz selected samples from the source stream."""
+        source = [
+            {'timestamp': i / 1000.0, 'value': float(i)}
+            for i in range(1000)
+        ]
+
+        downsampler = Downsampler(source_sample_rate=1000.0, target_sample_rate=10.0)
+        output = downsampler.process(source)
+
+        assert len(output) == 10
+        assert output[0]['timestamp'] == 0.0
+        assert output[-1]['timestamp'] == 0.9
+
+    def test_real_s3_client_uses_localstack_endpoint(self):
+        """RealS3Client should surface LocalStack-aware endpoint configuration."""
+        config = S3Config(
+            bucket_name='edge-vibration-data',
+            region='us-east-1',
+            endpoint_url='http://localhost:4566',
+            aws_access_key_id='test',
+            aws_secret_access_key='test',
+            use_ssl=False,
+        )
+
+        client = RealS3Client(config=config)
+        assert client.config.endpoint_url == 'http://localhost:4566'
+        assert client.config.use_ssl is False
+
+    def test_batch_can_store_10hz_samples(self):
+        """Batch should accept a 10Hz sample list while keeping window data unchanged."""
+        batch = Batch(
+            batch_id='test',
+            sensor_id='sensor_1',
+            device_id='device_1',
+            windows=[],
+            created_at=time.time(),
+            samples=[
+                {'timestamp': i / 10.0, 'acceleration': float(i)}
+                for i in range(10)
+            ],
+        )
+
+        assert len(batch.samples) == 10
+        assert batch.samples[0]['timestamp'] == 0.0
 
 
 class TestCloudSync:

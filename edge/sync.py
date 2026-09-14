@@ -4,24 +4,30 @@ import gzip
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+try:
+    import boto3
+except Exception:  # pragma: no cover - boto3 is optional for environments without AWS.
+    boto3 = None
 
 
 @dataclass
 class Batch:
-    """A batch of window features to be uploaded."""
+    """A batch of window features and optional downsampled 10Hz samples."""
     batch_id: str
     sensor_id: str
     device_id: str
     windows: List[Dict[str, Any]]
     created_at: float
     compression: str = "gzip"
-    
+    samples: List[Dict[str, Any]] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'batch_id': self.batch_id,
@@ -29,15 +35,18 @@ class Batch:
             'device_id': self.device_id,
             'windows': self.windows,
             'created_at': self.created_at,
-            'compression': self.compression
+            'compression': self.compression,
+            'samples': self.samples,
         }
-    
+
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Batch':
-        return cls(**data)
+        payload = dict(data)
+        payload.setdefault('samples', [])
+        return cls(**payload)
 
 
 class S3Config:
@@ -58,6 +67,97 @@ class S3Config:
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.use_ssl = use_ssl
+
+
+class Downsampler:
+    """Take a high-rate stream and keep one sample every source/target-rate stride.
+
+    Example: a 1000Hz stream and a target of 10Hz produces one sample per
+    100 source samples, giving a clean 10Hz downsampled payload.
+    """
+
+    def __init__(self, source_sample_rate: float = 1000.0, target_sample_rate: float = 10.0):
+        self.source_sample_rate = float(source_sample_rate)
+        self.target_sample_rate = float(target_sample_rate)
+        if self.source_sample_rate <= 0:
+            raise ValueError("source_sample_rate must be positive")
+        if self.target_sample_rate <= 0:
+            raise ValueError("target_sample_rate must be positive")
+        self.step = max(1, int(round(self.source_sample_rate / self.target_sample_rate)))
+
+    def process(self, samples: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return every Nth record from a source sample sequence."""
+        if not samples:
+            return []
+        return [dict(sample) for idx, sample in enumerate(samples) if idx % self.step == 0]
+
+
+class RealS3Client:
+    """A boto3-backed S3 client aimed at LocalStack or a real S3-compatible endpoint."""
+
+    def __init__(self, config: Optional[S3Config] = None, use_localstack: bool = True):
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for RealS3Client")
+        self.config = config or S3Config()
+        self.use_localstack = use_localstack
+
+        self._client = boto3.client(
+            's3',
+            region_name=self.config.region,
+            endpoint_url=self.config.endpoint_url,
+            aws_access_key_id=self.config.aws_access_key_id or 'test',
+            aws_secret_access_key=self.config.aws_secret_access_key or 'test',
+            use_ssl=self.config.use_ssl,
+        )
+        self._resource = boto3.resource(
+            's3',
+            region_name=self.config.region,
+            endpoint_url=self.config.endpoint_url,
+            aws_access_key_id=self.config.aws_access_key_id or 'test',
+            aws_secret_access_key=self.config.aws_secret_access_key or 'test',
+            use_ssl=self.config.use_ssl,
+        )
+
+    def upload(self, key: str, data: bytes) -> bool:
+        """Upload a gzip-compressed payload object to the configured bucket."""
+        try:
+            self._client.put_object(Bucket=self.config.bucket_name, Key=key, Body=data)
+            return True
+        except Exception:
+            return False
+
+    def upload_batch(self, batch: Batch) -> bool:
+        """Upload a batch object using the same deterministic key partitioning as the mock client."""
+        timestamp = datetime.fromtimestamp(batch.created_at)
+        key = self._get_object_key(batch, timestamp)
+        data = batch.to_json().encode("utf-8")
+        compressed = gzip.compress(data)
+        return self.upload(key, compressed)
+
+    def _get_object_key(self, batch: Batch, timestamp: datetime) -> str:
+        return (
+            f"{batch.device_id}/{batch.sensor_id}/"
+            f"year={timestamp.year}/"
+            f"month={timestamp.month:02d}/"
+            f"day={timestamp.day:02d}/"
+            f"hour={timestamp.hour:02d}/"
+            f"{batch.batch_id}.json.gz"
+        )
+
+    def get_object(self, key: str) -> Optional[bytes]:
+        """Read back an object from S3 using boto3 resource semantics."""
+        try:
+            return self._resource.Object(self.config.bucket_name, key).get()['Body'].read()
+        except Exception:
+            return None
+
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """List object keys filtered by a prefix inside the configured bucket."""
+        try:
+            bucket = self._resource.Bucket(self.config.bucket_name)
+            return [obj.key for obj in bucket.objects.filter(Prefix=prefix)]
+        except Exception:
+            return []
 
 
 class FileQueue:
@@ -215,7 +315,7 @@ class MockS3Client:
 class CloudSync:
     """
     Cloud sync layer for uploading processed window features.
-    
+
     Features:
     - Batches windows into configurable batch sizes
     - Compresses batches before upload
@@ -224,7 +324,7 @@ class CloudSync:
     - Non-blocking (runs in background thread)
     - Decoupled from processor
     """
-    
+
     def __init__(
         self,
         sensor_id: str = "vibration_01",
@@ -236,7 +336,9 @@ class CloudSync:
         retry_delay: float = 1.0,  # Initial retry delay in seconds
         max_retries: int = 5,
         failure_rate: float = 0.0,  # Simulated failure rate
-        background: bool = True  # Run uploads in background thread
+        background: bool = True,  # Run uploads in background thread
+        s3_client: Optional[Any] = None,
+        use_localstack: bool = False,
     ):
         self.sensor_id = sensor_id
         self.device_id = device_id
@@ -247,18 +349,24 @@ class CloudSync:
         self.max_retries = max_retries
         self.failure_rate = failure_rate
         self.background = background
-        
-        # Initialize components
-        self.s3_client = MockS3Client(
-            config=s3_config,
-            failure_rate=failure_rate,
-            use_localstack=False
-        )
+
+        if s3_client is not None:
+            self.s3_client = s3_client
+        elif use_localstack:
+            cfg = s3_config or S3Config(endpoint_url='http://localhost:4566', use_ssl=False)
+            self.s3_client = RealS3Client(config=cfg, use_localstack=True)
+        else:
+            self.s3_client = MockS3Client(
+                config=s3_config,
+                failure_rate=failure_rate,
+                use_localstack=False,
+            )
         self.file_queue = FileQueue(queue_dir)
-        
+
         # Current batch
         self.current_batch: Optional[Batch] = None
         self.current_batch_windows: List[Dict[str, Any]] = []
+        self.current_batch_samples: List[Dict[str, Any]] = []
         self.current_batch_created: float = 0.0
         
         # Threading
@@ -315,6 +423,7 @@ class CloudSync:
                     created_at=now,
                 )
                 self.current_batch_windows = []
+                self.current_batch_samples = []
                 self.current_batch_created = now
 
             if hasattr(window_features, "__dict__"):
@@ -343,6 +452,7 @@ class CloudSync:
             if should_upload:
                 self.current_batch.windows = self.current_batch_windows
                 self.current_batch.created_at = self.current_batch_created
+                self.current_batch.samples = self.current_batch_samples.copy()
 
                 batch_to_upload = Batch(
                     batch_id=self.current_batch.batch_id,
@@ -350,6 +460,7 @@ class CloudSync:
                     device_id=self.current_batch.device_id,
                     windows=self.current_batch_windows.copy(),
                     created_at=self.current_batch_created,
+                    samples=self.current_batch_samples.copy(),
                 )
 
                 self.file_queue.enqueue(batch_to_upload)
@@ -361,11 +472,28 @@ class CloudSync:
 
                 self.current_batch = None
                 self.current_batch_windows = []
+                self.current_batch_samples = []
     
+    def add_samples(self, samples: List[Dict[str, Any]]) -> None:
+        """Attach the 10Hz sample payload to the current batch for optional LocalStack upload."""
+        with self._queue_lock:
+            if self.current_batch is None:
+                self.current_batch = Batch(
+                    batch_id=str(uuid.uuid4()),
+                    sensor_id=self.sensor_id,
+                    device_id=self.device_id,
+                    windows=[],
+                    created_at=time.time(),
+                )
+                self.current_batch_windows = []
+                self.current_batch_samples = []
+                self.current_batch_created = self.current_batch.created_at
+            self.current_batch_samples.extend(samples)
+
     def _upload_batch_with_retry(self, batch: Batch, retry_count: int = 0) -> bool:
         """
         Upload a batch with exponential backoff retry.
-        
+
         Returns True if successful, False if max retries exceeded.
         """
         success = self.s3_client.upload_batch(batch)
@@ -400,24 +528,27 @@ class CloudSync:
             if self.current_batch is not None and len(self.current_batch_windows) > 0:
                 self.current_batch.windows = self.current_batch_windows
                 self.current_batch.created_at = self.current_batch_created
-                
+                self.current_batch.samples = self.current_batch_samples.copy()
+
                 batch_to_upload = Batch(
                     batch_id=self.current_batch.batch_id,
                     sensor_id=self.current_batch.sensor_id,
                     device_id=self.current_batch.device_id,
                     windows=self.current_batch_windows.copy(),
-                    created_at=self.current_batch_created
+                    created_at=self.current_batch_created,
+                    samples=self.current_batch_samples.copy(),
                 )
-                
+
                 self.file_queue.enqueue(batch_to_upload)
-                
+
                 if self.background:
                     self._upload_queue.put((batch_to_upload, 0))
                 else:
                     self._upload_batch_with_retry(batch_to_upload, 0)
-                
+
                 self.current_batch = None
                 self.current_batch_windows = []
+                self.current_batch_samples = []
         
         # No join() here; queue is file-backed and the sync thread owns retry
         # timing independently of the batch enqueue path.
@@ -461,4 +592,5 @@ class CloudSync:
     def set_failure_rate(self, rate: float) -> None:
         """Set simulated failure rate."""
         self.failure_rate = rate
-        self.s3_client.set_failure_rate(rate)
+        if hasattr(self.s3_client, 'set_failure_rate'):
+            self.s3_client.set_failure_rate(rate)
