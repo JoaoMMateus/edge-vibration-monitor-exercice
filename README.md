@@ -2,7 +2,7 @@
 
 An edge IoT pipeline for vibration monitoring with synthetic sensor data, streaming processing, anomaly detection, and cloud sync to S3 (with LocalStack mock).
 
-> **Note**: This implementation was developed with assistance from Mistral Vibe, a CLI coding agent.
+> **Note**: This implementation was developed with assistance from **Mistral Vibe**, a CLI coding agent.
 
 ## Overview
 
